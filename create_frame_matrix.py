@@ -358,7 +358,7 @@ if __name__ == '__main__':
     parser.add_argument('--depth_suffix', type=str, default='.npy')
     parser.add_argument('--width', type=int, default=576)  # 512
     parser.add_argument('--height', type=int, default=320) # 512
-    parser.add_argument('--focal', type=float, default=800) # 400, 600, 800
+    parser.add_argument('--focal', type=float, default=800) # 400, 500, 600, 800; image resolution affects the choice of focal: Fov=2 * math.atan(width / (2 * fx)), 60^o~100^o a good choice
     parser.add_argument('--max_baseline', type=float, default=0.08) # 0.05, 0.06, 0.07, 0.08
     parser.add_argument('--num_training_views', type=int, default=8)  # number of camera views (frame matrix). 4, 6, 8
     parser.add_argument('--farest_depth', type=float, default=10) 
