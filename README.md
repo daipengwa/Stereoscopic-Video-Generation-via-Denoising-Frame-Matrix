@@ -84,7 +84,7 @@ We use estimated relative depth and normalize it into 1~10m. Note that the close
 ### Camera settings
 We use two parallel cameras (fx, fy: 800) with a 7cm distance between them (objects will be in front of the screen). According to your preference, you can change the fx/fy or toe in the two cameras (two cameras have a coverage point).
 
-### The number of cameras between left and right views
+### The number of cameras
 We place 8 cameras (include left and right views) in spatial direction. You can reduce the number of cameras to expedite the generation process when the case is easy or the disoccluded regions are small. In practice, we found that 4 cameras also produce competitive results.
 
 ### Video generation model
