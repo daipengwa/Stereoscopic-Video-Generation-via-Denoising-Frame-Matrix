@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import argparse
 import numpy as np
 from PIL import Image
@@ -35,33 +34,37 @@ class SVGDiffusion:
         parser.add_argument("--init_image", type=str, default='./Videos/frame_matrix/xxx', help="The path to the input frame matrix")
         parser.add_argument("--output_root", type=str, default='./results/',help="The path to save results")
         parser.add_argument("--model_path", type=str, default="cerspense/zeroscope_v2_576w", help="Video generation model. The path to the HuggingFace model",)
-        parser.add_argument("--batch_size", type=int, default=1, help="The number of videos to generate")
+        parser.add_argument("--batch_size", type=int, default=1, help="The number of videos to generate, currently only 1")
         parser.add_argument("--device", type=str, default="cuda")
         parser.add_argument("--low_ram_vae", type=int, default=0, help="save ram for video diffusion",)
         parser.add_argument("--num_inference_steps", type=int, default=50, help="The number of denoising inference steps")
+        parser.add_argument("--guidance_scale_init", type=float, default=3.5, help="CFG at the early denoising stage; enlarge cfg --> sharp")
+        parser.add_argument("--guidance_scale_end", type=float, default=7.5, help="CFG")
         parser.add_argument("--downscale", type=int, default=8, help="downsample scale from image to latent, zeroscope is 8")
-        parser.add_argument("--threshold", type=float, default=0.7, help="detremine known and unknown regions")
-        parser.add_argument("--resample", type=int, default=6, help="resample xxx times")
-        parser.add_argument("--num_views", type=int, default=8, help="number of camera views, match the frame matrix creation")
+        parser.add_argument("--threshold_init", type=float, default=0.2, help="detremine known and unknown regions at the early denoising stage")
+        parser.add_argument("--threshold_end", type=float, default=0.7, help="detremine known and unknown regions")
+        parser.add_argument("--resample", type=int, default=8, help="resample xxx times, e.g., 8, 6, 4...; feel-free to change this parameter")
+        parser.add_argument("--num_views", type=int, default=8, help="number of camera views, match the frame matrix creation. Can reduce it for faster generation")
         parser.add_argument('--negative_prompt', type=str, default='low-quality, blurry, flickering, ghost', help='') 
         parser.add_argument('--soft_mask_k', type=int, default=5, help='kernel size used to create soft mask') 
         parser.add_argument('--soft_mask_type', type=str, default='gaussian', help='kernel type') 
         parser.add_argument('--frame_matrix_end', type=int, default=500, help='stop denoising frame matrix at xxx') 
         parser.add_argument('--update_source_latent', type=bool, default=True, help='True: apply disocclusion boundary re-injection') 
         parser.add_argument('--update_source_latent_end', type=int, default=0, help='stop disocclusion boundary re-injection at xxx.') 
-        parser.add_argument('--last_view_idx', type=int, default=7, help='another view idx to form stereoscopic video [0, another view idx], e.g., num_views - 1') 
-        parser.add_argument('--monocular_video_idx', type=int, default=0, help='0 if middle2leftright is False, else int(num_views/2)') 
-        parser.add_argument('--last_view_resample', type=int, default=2, help='resample xxx times for the last view') 
-        parser.add_argument('--erode_size', type=int, default=3, help='erode the warped image a little, considering the inaccurate depth')
-        parser.add_argument('--middle2leftright', action='store_true', help='reference video is projected into left and right views')
+        parser.add_argument('--last_view_idx', type=int, default=7, help='target view idx forming stereoscopic video [0, target view idx], e.g., num_views - 1') 
+        parser.add_argument('--monocular_video_idx', type=int, default=0, help='0 if middle2leftright is False, else int(num_views/2). Skip operations on this view can save time') 
+        parser.add_argument('--last_view_resample', type=int, default=2, help='resample xxx times for the last/anchor view') 
+        parser.add_argument('--erode_size', type=int, default=3, help='erode the warped image considering the inaccurate depth, harmful for thin structures. Increase it if you find there are boundary artifacts, decrease it when thin structces are removed.')
+        parser.add_argument('--middle2leftright', action='store_true', help='reference video is warped into left and right views')
         parser.add_argument('--right2left', action='store_true', help='reference video is the right-view video')  
         parser.add_argument('--height', type=int, default=320, help='image height') 
         parser.add_argument('--width', type=int, default=576, help='image width') 
         parser.add_argument('--latent_h', type=int, default=40, help='latent height, image height/downscale') 
         parser.add_argument('--latent_w', type=int, default=72, help='latent width') 
+        parser.add_argument('--speedy_denoising', action='store_true', help='for fast generation, only select partial rows/columns')
         
         # for multi-view video, frame_matrix_end <= 0
-        parser.add_argument('--fix_last_view_begin', type=int, default=600, help='exclusively denosie the last view after xxx') 
+        parser.add_argument('--fix_last_view_begin', type=int, default=600, help='exclusively denosie the last/anchor view after xxx') 
         parser.add_argument('--stage2_resample', type=int, default=4, help='resample xxx times')
         parser.add_argument('--stage2_time_direction_denoise_freq', type=int, default=3, help='denoise in time direction every xxx resamples')
         
@@ -90,7 +93,6 @@ class SVGDiffusion:
         #     subfolder="scheduler",
         #     torch_dtype=torch.float16,)
 
-        
         # DDPM scheduler
         self.scheduler = DDPMScheduler.from_pretrained(
             self.args.model_path,
@@ -100,10 +102,12 @@ class SVGDiffusion:
 
         self.alphas = self.scheduler.alphas_cumprod.to(self.args.device)
 
-    def load_video_images(self, frame_path, h=320 ,w=576, latent_h=40, latent_w=72, num_frames=16, suffix='.jpg', downscale=8, threshold=0.5, num_views=8, soft_mask_k=3, soft_mask_type='gaussian', erode_size=3):
+    def load_video_images(self, frame_path, h=320 ,w=576, latent_h=40, latent_w=72, num_frames=16, suffix='.jpg', downscale=8, threshold_init=0.5, threshold_end=0.5, num_views=8, soft_mask_k=3, soft_mask_type='gaussian', erode_size=3):
         frames_all = []
         ori_masks_all = []
-        latent_masks_all = []
+        ori_masks_soft_all = []
+        latent_masks_end_all = []
+        latent_masks_begin_all = []
 
         def create_latent_mask(masks_ori, latent_h, latent_w, down_scale=8, threshold=0.5, enable_remove=True):
             """
@@ -117,8 +121,8 @@ class SVGDiffusion:
                 mask_cur = masks_ori[i]
                 if enable_remove and down_scale > 1:
                     mask_cur = cv2.filter2D(masks_ori[i], -1, kernel)
-                    # remove unreliable positions, controled by threshold.
-                    ## reference video in the frame matrix retains all information. 
+                    # remove unreliable positions, controled by threshold. Cannot handle negative effects from unknown regions
+                    # reference video in the frame matrix retains all information. 
                     mask_cur[np.where(mask_cur<threshold)] = 0  
                     mask_cur[np.where(mask_cur>=threshold)] = 1  
                     mask_cur = mask_cur*masks_ori[i,:,:,0]
@@ -151,7 +155,9 @@ class SVGDiffusion:
             frame_names = sorted(glob.glob(frame_path + '/*%03d%s' % (view_idx, suffix)))
             frames = []
             ori_masks = []
-            latent_masks = []
+            ori_masks_soft = []
+            latent_masks_end = []
+            latent_masks_begin = []
             kernel = np.ones((erode_size, erode_size), np.float32) / erode_size*erode_size
 
             for i in range(num_frames):
@@ -162,7 +168,7 @@ class SVGDiffusion:
                 frames.append(img)
                 
                 # load mask images, 0 or 1, 0 is unknown region.
-                # erode a liitle bit, when boundary is not accurate
+                # erode a liitle bit, when boundary is not accurate. Forground content leaks into BG will cause artifacts.
                 mask = cv2.imread(frame_name.replace(suffix, '_mask.png'), -1)/255.0
                 ori_mask = cv2.resize(mask, (w, h))
                 if erode_size > 1:
@@ -177,18 +183,29 @@ class SVGDiffusion:
             frames = frames*ori_masks
 
             # resize the mask, match the size of latent feature
-            latent_masks = create_latent_mask(ori_masks, latent_h, latent_w, down_scale=downscale, threshold=threshold)
+            latent_masks_begin = create_latent_mask(ori_masks, latent_h, latent_w, down_scale=downscale, threshold=threshold_init)
+            latent_masks_end = create_latent_mask(ori_masks, latent_h, latent_w, down_scale=downscale, threshold=threshold_end)
+            
+            # soft mask
             if soft_mask_k >= 1:
-                latent_masks = create_soft_mask(latent_masks, soft_mask_k, soft_mask_type)          
+                latent_masks_begin = create_soft_mask(latent_masks_begin, soft_mask_k, soft_mask_type) 
+                latent_masks_end = create_soft_mask(latent_masks_end, soft_mask_k, soft_mask_type) 
+                ori_masks_soft = create_soft_mask(ori_masks, soft_mask_k, soft_mask_type)   
+                       
             frames_all.append(frames)
             ori_masks_all.append(ori_masks)
-            latent_masks_all.append(latent_masks)
+            ori_masks_soft_all.append(ori_masks_soft)
+            latent_masks_begin_all.append(latent_masks_begin)
+            latent_masks_end_all.append(latent_masks_end)
+            
 
         frames_all = np.stack(frames_all)
         ori_masks_all = np.stack(ori_masks_all)
-        latent_masks_all = np.stack(latent_masks_all)
+        ori_masks_soft_all = np.stack(ori_masks_soft_all)
+        latent_masks_begin_all = np.stack(latent_masks_begin_all)
+        latent_masks_end_all = np.stack(latent_masks_end_all)
 
-        return frames_all, ori_masks_all, latent_masks_all
+        return frames_all, ori_masks_all, latent_masks_begin_all, ori_masks_soft_all, latent_masks_end_all
 
     @torch.no_grad()
     def denoising_process(
@@ -201,9 +218,11 @@ class SVGDiffusion:
         latent_h=40,
         latent_w=72,
         num_inference_steps=50,
-        guidance_scale=7.5,
+        guidance_scale_init=7.5,
+        guidance_scale_end=7.5,
         generator=torch.manual_seed(42),
-        threshold=0.5,
+        threshold_init=0.5,
+        threshold_end=0.5,
         downscale=8,
         resample=8,
         num_views=8,
@@ -222,6 +241,7 @@ class SVGDiffusion:
         middle2leftright=False,
         monocular_video_idx=0,
         right2left=False,
+        speedy_denoising=False,
     ):
         
 
@@ -252,13 +272,13 @@ class SVGDiffusion:
 
             # replace in image space
             pred_original_images = pred_original_images * (1-ori_masks) + images * ori_masks
-
+            
             # update known features by encoding again
             with torch.no_grad():
                 source_latents_updated = self.images2latents(pred_original_images, use_mean=False)
             return source_latents_updated
         
-        def ddpm_resample(latents_cur, t_next, t_cur, resample, source_latents, latent_masks, text_embeddings, guidance_scale, num_frames=16, num_views=8, last_view_idx=7, last_view_resample=4, fix_last_view_begin=-1, frame_matrix_end=500, stage2_resample=8):
+        def ddpm_resample(latents_cur, t_next, t_cur, resample, source_latents, latent_masks, text_embeddings, guidance_scale, num_frames=16, num_views=8, last_view_idx=7, last_view_resample=4, fix_last_view_begin=-1, frame_matrix_end=500, stage2_resample=8, speedy_denoising=False):
 
             if resample==0:
                 return latents_cur
@@ -308,6 +328,7 @@ class SVGDiffusion:
                 stage2_denoise = False 
 
             # begin resample
+            # This implementation only handle one cloumn/row each time. If enough memory is avaiable, parallelize the denoising process will save time.
             for i in range(int(resample)):
                 ## Markov scheme, add nosie step by step, back to t_next. (z_(t-1) -> z_t)
                 betas = self.scheduler.betas
@@ -331,77 +352,123 @@ class SVGDiffusion:
         
                 denoise_accmulated = torch.zeros_like(latents)
                 operation_accmulated = torch.zeros_like(latents)
-                denoise_accmulated_last_view = None
-
-                if t_next > frame_matrix_end:
-                    # denoise in different directions
-                    if not stage2_denoise:
+                
+                if speedy_denoising:
+                    if t_next > frame_matrix_end:
+                        # denoise in different directions
                         if i%4 == 0 or i%4 == 2:
-                            # denoise in time direction
-                            for view_idx in range(num_views):
-                                noise_pred = predict_noise(latents[view_idx, :, :, :, :, :], t, text_embeddings, guidance_scale)
-                                denoise_accmulated[view_idx, :, :, :, :, :] = denoise_accmulated[view_idx, :, :, :, :, :] + self.scheduler.step(noise_pred, t, latents[view_idx, :, :, :, :, :]).prev_sample
-                                operation_accmulated[view_idx, :, :, :, :, :] =  operation_accmulated[view_idx, :, :, :, :, :] + 1
+                            # denoise in combined direction
+                            latent_first_row = latents[:, :, :, 0, :, :].permute(1,2,0,3,4)
+                            latent_last_column = latents[-1, :, :, 1:-1, :, :]
+                            latent_last_row_flip = torch.flip(latents[:, :, :, -1, :, :], dims=[0]).permute(1,2,0,3,4)
+                            latent_selected = torch.cat((latent_first_row, latent_last_column, latent_last_row_flip), axis=2)
+                            noise_pred = predict_noise(latent_selected, t, text_embeddings, guidance_scale)
+                            outputs_after_step = self.scheduler.step(noise_pred, t, latent_selected) # z_t -> z_(t-1)
+                            
+                            operation_accmulated[:, :, :, 0, :, :] = 1
+                            operation_accmulated[-1, :, :, :, :, :] = 1
+                            operation_accmulated[:, :, :, -1, :, :] = 1
+
+                            denoise_accmulated_selected = outputs_after_step.prev_sample  # z_(t-1)
+                            denoise_accmulated[:,:,:,0,:,:] = denoise_accmulated_selected[:,:,:num_views,:,:].permute(2,0,1,3,4)
+                            denoise_accmulated[-1,:,:,1:-1,:,:] = denoise_accmulated_selected[:,:,num_views:(num_frames+num_views-2),:,:]
+                            denoise_accmulated[:,:,:,-1,:,:] = torch.flip(denoise_accmulated_selected[:,:,(num_views+num_frames-2):,:,:], dims=[2]).permute(2,0,1,3,4)
 
                         elif i%4 == 1:                  
                             # denoise in spatial direction, view_0 to view_N
-                            for time_idx in range(num_frames):
+                            for time_idx in [0, num_frames-1]:
                                 noise_pred = predict_noise(latents[:, :, :, time_idx, :, :].permute(1,2,0,3,4), t, text_embeddings, guidance_scale)
                                 denoise_accmulated[:, :, :, time_idx, :, :] = denoise_accmulated[:, :, :, time_idx, :, :] + (self.scheduler.step(noise_pred, t, latents[:, :, :, time_idx, :, :].permute(1,2,0,3,4)).prev_sample).permute(2,0,1,3,4)
                                 operation_accmulated[:, :, :, time_idx, :, :] =  operation_accmulated[:, :, :, time_idx, :, :] + 1
                             
                         elif i%4 == 3:
                             # denoise in spatial direction, view_N to view_0
-                            for time_idx in range(num_frames):
+                            for time_idx in [0, num_frames-1]:
                                 noise_pred = torch.flip(predict_noise(torch.flip(latents[:, :, :, time_idx, :, :], dims=[0]).permute(1,2,0,3,4), t, text_embeddings, guidance_scale), dims=[2])
                                 denoise_accmulated[:, :, :, time_idx, :, :] = denoise_accmulated[:, :, :, time_idx, :, :] + (self.scheduler.step(noise_pred, t, latents[:, :, :, time_idx, :, :].permute(1,2,0,3,4)).prev_sample).permute(2,0,1,3,4)
                                 operation_accmulated[:, :, :, time_idx, :, :] =  operation_accmulated[:, :, :, time_idx, :, :] + 1
                     else:
-                        # stage2 denoising
-                        ## change the frequency of spatial and time directions
-                        if (i+1) % stage2_time_direction_denoise_freq == 0: 
-                            print('stage2: update time direction')
-                            for view_idx in range(num_views):
-                                noise_pred = predict_noise(latents[view_idx, :, :, :, :, :], t, text_embeddings, guidance_scale)
-                                denoise_accmulated[view_idx, :, :, :, :, :] = denoise_accmulated[view_idx, :, :, :, :, :] + self.scheduler.step(noise_pred, t, latents[view_idx, :, :, :, :, :]).prev_sample
-                                operation_accmulated[view_idx, :, :, :, :, :] =  operation_accmulated[view_idx, :, :, :, :, :] + 1
+                        # only denoise required views
+                        if middle2leftright:
+                            view_idxs = [0, last_view_idx]
                         else:
-                            print("stage2: update spatial direction")
-                            if i % 2 == 0:
-                                # update the spatial direction, view_0 to view_N
+                            view_idxs = [last_view_idx]
+                            
+                        for view_idx in view_idxs:
+                            noise_pred = predict_noise(latents[view_idx, :, :, :, :, :], t, text_embeddings, guidance_scale)
+                            denoise_accmulated[view_idx, :, :, :, :, :] = denoise_accmulated[view_idx, :, :, :, :, :] + self.scheduler.step(noise_pred, t, latents[view_idx, :, :, :, :, :]).prev_sample
+                            operation_accmulated[view_idx, :, :, :, :, :] =  operation_accmulated[view_idx, :, :, :, :, :] + 1
+                else:
+                    if t_next > frame_matrix_end:
+                        # denoise in different directions
+                        if not stage2_denoise:
+                            if i%4 == 0 or i%4 == 2:
+                                # denoise in time direction
+                                for view_idx in range(num_views):
+                                    noise_pred = predict_noise(latents[view_idx, :, :, :, :, :], t, text_embeddings, guidance_scale)
+                                    denoise_accmulated[view_idx, :, :, :, :, :] = denoise_accmulated[view_idx, :, :, :, :, :] + self.scheduler.step(noise_pred, t, latents[view_idx, :, :, :, :, :]).prev_sample
+                                    operation_accmulated[view_idx, :, :, :, :, :] =  operation_accmulated[view_idx, :, :, :, :, :] + 1
+
+                            elif i%4 == 1:                  
+                                # denoise in spatial direction, view_0 to view_N
                                 for time_idx in range(num_frames):
                                     noise_pred = predict_noise(latents[:, :, :, time_idx, :, :].permute(1,2,0,3,4), t, text_embeddings, guidance_scale)
                                     denoise_accmulated[:, :, :, time_idx, :, :] = denoise_accmulated[:, :, :, time_idx, :, :] + (self.scheduler.step(noise_pred, t, latents[:, :, :, time_idx, :, :].permute(1,2,0,3,4)).prev_sample).permute(2,0,1,3,4)
                                     operation_accmulated[:, :, :, time_idx, :, :] =  operation_accmulated[:, :, :, time_idx, :, :] + 1
-                            
-                            if i % 2 == 1:
-                                # update the spatial direction, view_N to view_0
+                                
+                            elif i%4 == 3:
+                                # denoise in spatial direction, view_N to view_0
                                 for time_idx in range(num_frames):
                                     noise_pred = torch.flip(predict_noise(torch.flip(latents[:, :, :, time_idx, :, :], dims=[0]).permute(1,2,0,3,4), t, text_embeddings, guidance_scale), dims=[2])
                                     denoise_accmulated[:, :, :, time_idx, :, :] = denoise_accmulated[:, :, :, time_idx, :, :] + (self.scheduler.step(noise_pred, t, latents[:, :, :, time_idx, :, :].permute(1,2,0,3,4)).prev_sample).permute(2,0,1,3,4)
                                     operation_accmulated[:, :, :, time_idx, :, :] =  operation_accmulated[:, :, :, time_idx, :, :] + 1
-                        
-                        ## fix last view
-                        operation_accmulated[last_view_idx, :, :, :, :, :] = 1
-                        denoise_accmulated[last_view_idx, :, :, :, :, :] = latents_cur[last_view_idx, :, :, :, :, :]        
-                else:
-                    # only denoise required views
-                    if middle2leftright:
-                        view_idxs = [0, last_view_idx]
+                        else:
+                            # stage2 denoising
+                            ## change the frequency of spatial and time directions
+                            if (i+1) % stage2_time_direction_denoise_freq == 0: 
+                                print('stage2: update time direction')
+                                for view_idx in range(num_views):
+                                    noise_pred = predict_noise(latents[view_idx, :, :, :, :, :], t, text_embeddings, guidance_scale)
+                                    denoise_accmulated[view_idx, :, :, :, :, :] = denoise_accmulated[view_idx, :, :, :, :, :] + self.scheduler.step(noise_pred, t, latents[view_idx, :, :, :, :, :]).prev_sample
+                                    operation_accmulated[view_idx, :, :, :, :, :] =  operation_accmulated[view_idx, :, :, :, :, :] + 1
+                            else:
+                                print("stage2: update spatial direction")
+                                if i % 2 == 0:
+                                    # update the spatial direction, view_0 to view_N
+                                    for time_idx in range(num_frames):
+                                        noise_pred = predict_noise(latents[:, :, :, time_idx, :, :].permute(1,2,0,3,4), t, text_embeddings, guidance_scale)
+                                        denoise_accmulated[:, :, :, time_idx, :, :] = denoise_accmulated[:, :, :, time_idx, :, :] + (self.scheduler.step(noise_pred, t, latents[:, :, :, time_idx, :, :].permute(1,2,0,3,4)).prev_sample).permute(2,0,1,3,4)
+                                        operation_accmulated[:, :, :, time_idx, :, :] =  operation_accmulated[:, :, :, time_idx, :, :] + 1
+                                
+                                if i % 2 == 1:
+                                    # update the spatial direction, view_N to view_0
+                                    for time_idx in range(num_frames):
+                                        noise_pred = torch.flip(predict_noise(torch.flip(latents[:, :, :, time_idx, :, :], dims=[0]).permute(1,2,0,3,4), t, text_embeddings, guidance_scale), dims=[2])
+                                        denoise_accmulated[:, :, :, time_idx, :, :] = denoise_accmulated[:, :, :, time_idx, :, :] + (self.scheduler.step(noise_pred, t, latents[:, :, :, time_idx, :, :].permute(1,2,0,3,4)).prev_sample).permute(2,0,1,3,4)
+                                        operation_accmulated[:, :, :, time_idx, :, :] =  operation_accmulated[:, :, :, time_idx, :, :] + 1
+                            
+                            ## fix last view
+                            operation_accmulated[last_view_idx, :, :, :, :, :] = 1
+                            denoise_accmulated[last_view_idx, :, :, :, :, :] = latents_cur[last_view_idx, :, :, :, :, :]        
                     else:
-                        view_idxs = [last_view_idx]
-                        
-                    for view_idx in view_idxs:
-                        noise_pred = predict_noise(latents[view_idx, :, :, :, :, :], t, text_embeddings, guidance_scale)
-                        denoise_accmulated[view_idx, :, :, :, :, :] = denoise_accmulated[view_idx, :, :, :, :, :] + self.scheduler.step(noise_pred, t, latents[view_idx, :, :, :, :, :]).prev_sample
-                        operation_accmulated[view_idx, :, :, :, :, :] =  operation_accmulated[view_idx, :, :, :, :, :] + 1
+                        # only denoise required views
+                        if middle2leftright:
+                            view_idxs = [0, last_view_idx]
+                        else:
+                            view_idxs = [last_view_idx]
+                            
+                        for view_idx in view_idxs:
+                            noise_pred = predict_noise(latents[view_idx, :, :, :, :, :], t, text_embeddings, guidance_scale)
+                            denoise_accmulated[view_idx, :, :, :, :, :] = denoise_accmulated[view_idx, :, :, :, :, :] + self.scheduler.step(noise_pred, t, latents[view_idx, :, :, :, :, :]).prev_sample
+                            operation_accmulated[view_idx, :, :, :, :, :] =  operation_accmulated[view_idx, :, :, :, :, :] + 1
 
+                denoise_accmulated[torch.where(operation_accmulated==0)] = latents_cur[torch.where(operation_accmulated==0)]
                 operation_accmulated[torch.where(operation_accmulated==0)] = 1
                 latents_cur = denoise_accmulated/operation_accmulated  # finish one resample
 
             return latents_cur
 
-        def save_results(latents_all, save_idxs, is_list=True, step_idx=None):
+        def save_results(latents_all, save_idxs, is_list=True, step_idx=None, warped_images=None, warped_masks=None, possion_blending=False, kernel_size=15):
             for view_idx in save_idxs:
                 if is_list:
                     latents = latents_all[view_idx]
@@ -414,8 +481,45 @@ class SVGDiffusion:
                 results = (results / 2 + 0.5).clamp(0, 1)
                 results = results.detach().cpu().permute(0, 2, 3, 1).numpy()
                 results = (results * 255).round().astype("uint8")
-
                 save_frames(results, path=self.args.output_root, view_idx=view_idx, step_idx=step_idx)
+                
+                # possion blending to alleviate imperfect VAE
+                if possion_blending and warped_images is not None:
+                    warped_images = warped_images
+                    warped_masks = warped_masks
+                    warped_images_view = warped_images[view_idx]
+                    warped_masks_view = warped_masks[view_idx]
+                    blended_images = []
+                    for time_idx in range(warped_images_view.shape[0]):
+                        warped_image = warped_images_view[time_idx] 
+                        warped_mask = warped_masks_view[time_idx]
+                        generated_image = results[time_idx]
+                        replaced_image = warped_image * warped_mask + generated_image * (1 - warped_mask)
+                        
+                        if warped_mask.min() == 0:
+                            # import pdb; pdb.set_trace()
+                            # align the src and background images
+                            warped_mask[0, -1] = 0
+                            warped_mask[0, 0] = 0
+                            warped_mask[-1, 0] = 0
+                            warped_mask[-1, -1] = 0
+                            warped_mask = warped_mask
+                            center = (warped_image.shape[1] // 2, warped_image.shape[0] // 2)
+                            
+                            # provide more consistent and reasonable boundary constraint
+                            kernel = np.ones((kernel_size, kernel_size), np.uint8) 
+                            warped_mask = cv2.erode(warped_mask.astype(np.uint8), kernel, iterations=1)
+
+                            # blending
+                            blended_image = cv2.seamlessClone(generated_image, np.uint8(replaced_image), 255*(1-warped_mask), center, cv2.NORMAL_CLONE)
+                        else:
+                            blended_image = warped_image
+                            
+                        blended_images.append(blended_image)
+                    blended_images = np.stack(blended_images, axis=0)
+                    save_frames(blended_images, path=self.args.output_root + '/PS/', view_idx=view_idx, step_idx=step_idx)
+                        
+                
             return results
         
 
@@ -424,7 +528,7 @@ class SVGDiffusion:
             last_view_idx = num_views - 1
 
         # load video and convert to latent features
-        images_all, ori_masks_all, latent_masks_all = self.load_video_images(image_path, h=height, w=width, latent_h=latent_h, latent_w=latent_w, num_frames=num_frames, downscale=downscale, threshold=threshold, num_views=num_views, soft_mask_k=soft_mask_k, soft_mask_type=soft_mask_type, erode_size=erode_size)                                                         
+        images_all, ori_masks_all, latent_masks_all, ori_masks_soft_all, latent_masks_final_all = self.load_video_images(image_path, h=height, w=width, latent_h=latent_h, latent_w=latent_w, num_frames=num_frames, downscale=downscale, threshold_init=threshold_init, threshold_end=threshold_end, num_views=num_views, soft_mask_k=soft_mask_k, soft_mask_type=soft_mask_type, erode_size=erode_size)                                                         
         num_views, num_frames, _, _, _ = images_all.shape
         images_all = torch.from_numpy(images_all).to('cuda')
         source_latents_all = []   # source_latents_all contains known features
@@ -435,7 +539,9 @@ class SVGDiffusion:
 
         # reshape mask to match source latent
         ori_masks_all = torch.from_numpy(ori_masks_all).to('cuda').half()
+        ori_masks_soft_all = torch.from_numpy(ori_masks_soft_all).to('cuda').half()
         latent_masks_all = torch.from_numpy(latent_masks_all).to('cuda').half().unsqueeze(0).permute(1,0,5,2,3,4) # num_view X bacth X channel X num_frames X height X width
+        latent_masks_final_all = torch.from_numpy(latent_masks_final_all).to('cuda').half().unsqueeze(0).permute(1,0,5,2,3,4) # num_view X bacth X channel X num_frames X height X width
 
         # tokenizer and text embeddings
         ## text condition
@@ -482,6 +588,7 @@ class SVGDiffusion:
             denoise_accmulated = torch.zeros_like(latents_all)
             operation_accmulated = torch.zeros_like(latents_all) # counter
             pred_original_latents_all = source_latents_all + 0  # clean latent
+            
 
             # begin denoising
             if t > frame_matrix_end:
@@ -492,21 +599,62 @@ class SVGDiffusion:
                 else:
                     view_idxs = [last_view_idx]  # denoise the last view (right view for left2right, left view for right2left)
             
-            for view_idx in view_idxs:
-                noise_pred = predict_noise(latents_all[view_idx, :, :, :, :, :], t, text_embeddings, guidance_scale)
-                outputs_after_step = self.scheduler.step(noise_pred, t, latents_all[view_idx, :, :, :, :, :]) # z_t -> z_(t-1)
-                denoise_accmulated[view_idx, :, :, :, :, :] = denoise_accmulated[view_idx, :, :, :, :, :] + outputs_after_step.prev_sample  # z_(t-1)
-                pred_original_latents_all[view_idx, :, :, :, :, :] = outputs_after_step.pred_original_sample # z_0
-                operation_accmulated[view_idx, :, :, :, :, :] =  operation_accmulated[view_idx, :, :, :, :, :] + 1
+            # alternate guidance scale and latent mask    
+            if t < 500:
+                latent_masks_all = latent_masks_final_all
+                guidance_scale = guidance_scale_end
+            else:
+                guidance_scale = guidance_scale_init
 
+            
+            if speedy_denoising and t > frame_matrix_end:
+                # select first row, last column, last row for denoising
+                print('use speedy denoising')
+                latent_first_row = latents_all[:, :, :, 0, :, :].permute(1,2,0,3,4)
+                latent_last_column = latents_all[-1, :, :, 1:-1, :, :]
+                latent_last_row_flip = torch.flip(latents_all[:, :, :, -1, :, :], dims=[0]).permute(1,2,0,3,4)
+                latent_selected = torch.cat((latent_first_row, latent_last_column, latent_last_row_flip), axis=2)
+                noise_pred = predict_noise(latent_selected, t, text_embeddings, guidance_scale)
+                outputs_after_step = self.scheduler.step(noise_pred, t, latent_selected) # z_t -> z_(t-1)
+                
+                operation_accmulated[:, :, :, 0, :, :] = 1
+                operation_accmulated[-1, :, :, :, :, :] = 1
+                operation_accmulated[:, :, :, -1, :, :] = 1
+
+                denoise_accmulated_selected = outputs_after_step.prev_sample  # z_(t-1)
+                pred_original_latents_selected = outputs_after_step.pred_original_sample # z_0
+          
+                denoise_accmulated[:,:,:,0,:,:] = denoise_accmulated_selected[:,:,:num_views,:,:].permute(2,0,1,3,4)
+                denoise_accmulated[-1,:,:,1:-1,:,:] = denoise_accmulated_selected[:,:,num_views:(num_frames+num_views-2),:,:]
+                denoise_accmulated[:,:,:,-1,:,:] = torch.flip(denoise_accmulated_selected[:,:,(num_views+num_frames-2):,:,:], dims=[2]).permute(2,0,1,3,4)
+                
+                pred_original_latents_all[:,:,:,0,:,:] = pred_original_latents_selected[:,:,:num_views,:,:].permute(2,0,1,3,4)
+                pred_original_latents_all[-1,:,:,1:-1,:,:] = pred_original_latents_selected[:,:,num_views:(num_frames+num_views-2),:,:]
+                pred_original_latents_all[:,:,:,-1,:,:] = torch.flip(pred_original_latents_selected[:,:,(num_views+num_frames-2):,:,:], dims=[2]).permute(2,0,1,3,4)
+                
+                if middle2leftright:
+                    print('current speedy denoising implementation does not support middle2leftright')
+                    exit()
+            else:
+                for view_idx in view_idxs:
+                    noise_pred = predict_noise(latents_all[view_idx, :, :, :, :, :], t, text_embeddings, guidance_scale)
+                    outputs_after_step = self.scheduler.step(noise_pred, t, latents_all[view_idx, :, :, :, :, :]) # z_t -> z_(t-1)
+                    denoise_accmulated[view_idx, :, :, :, :, :] = denoise_accmulated[view_idx, :, :, :, :, :] + outputs_after_step.prev_sample  # z_(t-1)
+                    pred_original_latents_all[view_idx, :, :, :, :, :] = outputs_after_step.pred_original_sample # z_0
+                    operation_accmulated[view_idx, :, :, :, :, :] =  operation_accmulated[view_idx, :, :, :, :, :] + 1
+
+            denoise_accmulated[torch.where(operation_accmulated==0)] = latents_all[torch.where(operation_accmulated==0)]
             operation_accmulated[torch.where(operation_accmulated==0)] = 1
             latents_all = denoise_accmulated/operation_accmulated
 
             # disocclusion boundary re-injection
             if update_source_latent and (t > update_source_latent_end):
                 # update known features of frame matrix
+                print('update features around disocclusion boundary')
                 for view_idx in view_idxs:
-                    source_latents_all[view_idx] = disocclusion_boundary_reinjection(pred_original_latents_all[view_idx], source_latents_all[view_idx], latent_masks_all[view_idx], images_all[view_idx], ori_masks_all[view_idx])
+                    # Soft blending. the VAE is not perfect, discripancy between decoded content and warped content.
+                    source_latents_all[view_idx] = disocclusion_boundary_reinjection(pred_original_latents_all[view_idx], source_latents_all[view_idx], latent_masks_all[view_idx], images_all[view_idx], ori_masks_soft_all[view_idx])
+                    # source_latents_all[view_idx] = disocclusion_boundary_reinjection(pred_original_latents_all[view_idx], source_latents_all[view_idx], latent_masks_all[view_idx], images_all[view_idx], ori_masks_all[view_idx])
 
             # resmaple + denoising in time and spatial directions
             if t_prev is None:
@@ -515,7 +663,7 @@ class SVGDiffusion:
                 latents_all = ddpm_resample(latents_cur=latents_all, t_next=t, t_cur=t_prev, resample=resample, source_latents=source_latents_all, latent_masks=latent_masks_all, 
                                             text_embeddings=text_embeddings, guidance_scale=guidance_scale, num_frames=num_frames, num_views=num_views, 
                                             fix_last_view_begin=fix_last_view_begin, last_view_resample=last_view_resample, last_view_idx=last_view_idx,
-                                            frame_matrix_end=frame_matrix_end, stage2_resample=stage2_resample)
+                                            frame_matrix_end=frame_matrix_end, stage2_resample=stage2_resample, speedy_denoising=speedy_denoising)
 
             # add gaussian nosie to clean latents, combine known and unknown regions
             if t_prev is None:
@@ -533,7 +681,14 @@ class SVGDiffusion:
                     for view_idx in range(num_views):
                         latents_tmp[view_idx] = latents_tmp[view_idx] * (1 - latent_masks_all[view_idx]) + source_latents_all[view_idx] * latent_masks_all[view_idx]
 
-                    save_results(latents_all=1 / self.vae.config.scaling_factor * latents_tmp, save_idxs=[last_view_idx], step_idx=t)
+                    if speedy_denoising:
+                        latent_first_row = latents_tmp[:, :, :, 0, :, :].permute(1,2,0,3,4)
+                        latent_last_column = latents_tmp[-1, :, :, 1:-1, :, :]
+                        latent_last_row_flip = torch.flip(latents_tmp[:, :, :, -1, :, :], dims=[0]).permute(1,2,0,3,4)
+                        latent_selected = torch.cat((latent_first_row, latent_last_column, latent_last_row_flip), axis=2)
+                        save_results(latents_all=1 / self.vae.config.scaling_factor * latent_selected, save_idxs=[last_view_idx], step_idx=t, is_list=False)
+                    else:
+                        save_results(latents_all=1 / self.vae.config.scaling_factor * latents_tmp, save_idxs=[last_view_idx], step_idx=t)
                            
         # save results
         with torch.no_grad():
@@ -542,7 +697,7 @@ class SVGDiffusion:
                 save_idxs = [0, last_view_idx]
             else:
                 save_idxs = range(num_views) 
-            save_results(latents_all=1 / self.vae.config.scaling_factor * latents_all, save_idxs=save_idxs)
+            save_results(latents_all=1 / self.vae.config.scaling_factor * latents_all, save_idxs=save_idxs, warped_images=255*images_all.cpu().numpy(), warped_masks=ori_masks_all.cpu().numpy(), possion_blending=True)
 
         # save stereoscopic video
         if right2left:
@@ -704,9 +859,12 @@ if __name__ == "__main__":
     svg.args.init_image,
     num_frames = svg.args.num_frames,
     prompts=[svg.args.prompt] * svg.args.batch_size,
+    guidance_scale_init=svg.args.guidance_scale_init, 
+    guidance_scale_end=svg.args.guidance_scale_end, 
     num_inference_steps=svg.args.num_inference_steps, 
     downscale=svg.args.downscale,
-    threshold=svg.args.threshold,
+    threshold_init=svg.args.threshold_init,
+    threshold_end=svg.args.threshold_end,
     resample=svg.args.resample,
     num_views=svg.args.num_views,
     negative_prompt=svg.args.negative_prompt,
@@ -728,31 +886,7 @@ if __name__ == "__main__":
     width=svg.args.width,
     latent_h=svg.args.latent_h,
     latent_w=svg.args.latent_w,
+    speedy_denoising=svg.args.speedy_denoising,
     ) 
-    
-    
-
-    
-     
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-
-
  
-
-
-
 
