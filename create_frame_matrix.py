@@ -139,6 +139,7 @@ def remove_cracks_isolated_points(image, mask, depth, kernel_size=3, threshold_i
         mask_new[np.where(frame_weight > threshold)] = 1
         if len(image.shape) > len(mask_new.shape):
             mask_new = mask_new[..., None]
+        mask_new = mask_new * mask
         image_new = image * mask_new
         return image_new, mask_new
 
@@ -155,7 +156,8 @@ def remove_cracks_isolated_points(image, mask, depth, kernel_size=3, threshold_i
 
         mask_new = np.zeros_like(mask)
         mask_new[np.where(image_weight>threshold)] = 1.0
-        mask = mask_new * mask
+        mask_new = mask + mask_new
+        mask_new[np.where(mask_new > 0)] = 1
         image_new = image + 0
         image_new = image_new*mask + image_blur*(mask_new - mask)
 
