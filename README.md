@@ -7,6 +7,8 @@
 This is not an officially supported Google product. This project is not eligible for the [Google Open Source Software Vulnerability Rewards Program](https://bughunters.google.com/open-source-security).
 
 
+This forked repo will be maintained, since I do not have the right to update the original one.
+
 ## Environment
 ```
 conda create -n svg python=3.8
