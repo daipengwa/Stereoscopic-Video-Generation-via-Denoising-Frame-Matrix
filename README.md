@@ -7,7 +7,7 @@
 This is not an officially supported Google product. This project is not eligible for the [Google Open Source Software Vulnerability Rewards Program](https://bughunters.google.com/open-source-security).
 
 
-**This forked repo will be maintained because I do not have permission to update the original repository.**
+**Please use this forked repo because I do not have permission to update the original one.**
 
 ## Environment
 ```
